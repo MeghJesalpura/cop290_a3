@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,20 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -34,6 +35,8 @@
 #include "util/coding.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
+
+#include "db_impl.h"
 
 namespace leveldb {
 
@@ -596,6 +599,70 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
   }
 }
 
+Status DBImpl::ForceFullCompaction() {
+  FullCompactionStats stats;
+
+  // 1. Flush MemTable to L0
+  Status s = TEST_CompactMemTable();
+  if (!s.ok()) return s;
+
+  // 2. Compact each level sequentially
+  for (int level = 0; level < config::kNumLevels - 1; level++) {
+    // Note: TEST_CompactRange needs to be updated to accept stats
+    TEST_FullCompactRange(level, &stats);
+  }
+
+  // 3. Report Statistics
+  // printf("--------- Manual Compaction Statistics ---------\n");
+  // printf("Compactions executed: %d\n", stats.num_compactions);
+  // printf("Input files:          %d\n", stats.num_input_files);
+  // printf("Output files:         %d\n", stats.num_output_files);
+  // printf("Total bytes read:     %llu\n", (unsigned long
+  // long)stats.bytes_read); printf("Total bytes written:  %llu\n",
+  //        (unsigned long long)stats.bytes_written);
+  // printf("-----------------------------------------------\n");
+  printf("%d; %d; %d; %llu; %llu\n", stats.num_compactions,
+         stats.num_input_files, stats.num_output_files,
+         (unsigned long long)stats.bytes_read,
+         (unsigned long long)stats.bytes_written);
+
+  return Status::OK();
+}
+
+void DBImpl::TEST_FullCompactRange(int level, FullCompactionStats* stats) {
+  assert(level >= 0);
+  assert(level + 1 < config::kNumLevels);
+
+  InternalKey begin_storage, end_storage;
+
+  ManualCompaction manual;
+  manual.level = level;
+  manual.done = false;
+  manual.begin = nullptr;
+  manual.end = nullptr;
+  manual.stats = stats;
+
+  MutexLock l(&mutex_);
+  while (!manual.done && !shutting_down_.load(std::memory_order_acquire) &&
+         bg_error_.ok()) {
+    if (manual_compaction_ == nullptr) {  // Idle
+      manual_compaction_ = &manual;
+      MaybeScheduleCompaction();
+    } else {  // Running either my compaction or another compaction.
+      background_work_finished_signal_.Wait();
+    }
+  }
+  // Finish current background compaction in the case where
+  // `background_work_finished_signal_` was signalled due to an error.
+  while (background_compaction_scheduled_) {
+    background_work_finished_signal_.Wait();
+  }
+  if (manual_compaction_ == &manual) {
+    // Cancel my manual compaction since we aborted early for some reason.
+    manual_compaction_ = nullptr;
+  }
+}
+
 void DBImpl::TEST_CompactRange(int level, const Slice* begin,
                                const Slice* end) {
   assert(level >= 0);
@@ -722,6 +789,7 @@ void DBImpl::BackgroundCompaction() {
     m->done = (c == nullptr);
     if (c != nullptr) {
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
+      m->stats->num_input_files += c->num_input_files(0);
     }
     Log(options_.info_log,
         "Manual compaction at level-%d from %s .. %s; will stop at %s\n",
@@ -1043,6 +1111,16 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
 
   mutex_.Lock();
+  if (manual_compaction_ && manual_compaction_->stats) {
+    manual_compaction_->stats->bytes_read += stats.bytes_read;
+    manual_compaction_->stats->bytes_written += stats.bytes_written;
+    manual_compaction_->stats->num_compactions += 1;
+    manual_compaction_->stats->num_input_files +=
+        compact->compaction->num_input_files(0);
+    manual_compaction_->stats->num_input_files +=
+        compact->compaction->num_input_files(1);
+    manual_compaction_->stats->num_output_files += compact->outputs.size();
+  }
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
@@ -1165,6 +1243,19 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   return s;
 }
 
+Status DBImpl::Scan(const ReadOptions& read_opt, const Slice& start_key,
+                    const Slice& end_key,
+                    std::vector<std::pair<std::string, std::string>>* result) {
+  leveldb::Iterator* it = this->NewIterator(read_opt);
+  for (it->Seek(start_key);
+       it->Valid() && it->key().ToString() < end_key.ToString(); it->Next()) {
+    result->push_back({it->key().ToString(), it->value().ToString()});
+  }
+  Status s = it->status();
+  delete it;
+  return s;
+}
+
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
   SequenceNumber latest_snapshot;
   uint32_t seed;
@@ -1201,6 +1292,22 @@ Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
 
 Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
+}
+
+Status DBImpl::DeleteRange(const WriteOptions& write_opt,
+                           const Slice& start_key, const Slice& end_key) {
+  leveldb::Iterator* it = this->NewIterator(leveldb::ReadOptions());
+  leveldb::WriteBatch batch;
+  for (it->Seek(start_key);
+       it->Valid() && it->key().ToString() < end_key.ToString(); it->Next()) {
+    batch.Delete(it->key());
+  }
+  Status s = it->status();
+  delete it;
+  if (s.ok()) {
+    s = this->Write(write_opt, &batch);
+  }
+  return s;
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {

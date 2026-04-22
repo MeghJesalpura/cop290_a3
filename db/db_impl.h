@@ -5,16 +5,17 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
+#include "db/dbformat.h"
+#include "db/log_writer.h"
+#include "db/snapshot.h"
 #include <atomic>
 #include <deque>
 #include <set>
 #include <string>
 
-#include "db/dbformat.h"
-#include "db/log_writer.h"
-#include "db/snapshot.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -39,15 +40,23 @@ class DBImpl : public DB {
   Status Put(const WriteOptions&, const Slice& key,
              const Slice& value) override;
   Status Delete(const WriteOptions&, const Slice& key) override;
+  Status DeleteRange(const WriteOptions&, const Slice& start_key,
+                     const Slice& end_key) override;
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
+
+  Status Scan(
+      const ReadOptions&, const Slice& start_key, const Slice& end_key,
+      std::vector<std::pair<std::string, std::string>>* result) override;
+
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
   bool GetProperty(const Slice& property, std::string* value) override;
   void GetApproximateSizes(const Range* range, int n, uint64_t* sizes) override;
   void CompactRange(const Slice* begin, const Slice* end) override;
+  Status ForceFullCompaction() override;
 
   // Extra methods (for testing) that are not in the public DB interface
 
@@ -77,13 +86,32 @@ class DBImpl : public DB {
   struct Writer;
 
   // Information for a manual compaction
+
+  struct FullCompactionStats {
+    int num_compactions;
+    int num_input_files;
+    int num_output_files;
+    uint64_t bytes_read;
+    uint64_t bytes_written;
+
+    FullCompactionStats()
+        : num_compactions(0),
+          num_input_files(0),
+          num_output_files(0),
+          bytes_read(0),
+          bytes_written(0) {}
+  };
+
   struct ManualCompaction {
     int level;
     bool done;
     const InternalKey* begin;  // null means beginning of key range
     const InternalKey* end;    // null means end of key range
     InternalKey tmp_storage;   // Used to keep track of compaction progress
+    FullCompactionStats* stats;
   };
+
+  void TEST_FullCompactRange(int level, FullCompactionStats* stats);
 
   // Per level compaction stats.  stats_[level] stores the stats for
   // compactions that produced data for the specified "level".

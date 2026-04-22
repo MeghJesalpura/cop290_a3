@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 #include "leveldb/export.h"
 #include "leveldb/iterator.h"
@@ -72,6 +73,9 @@ class LEVELDB_EXPORT DB {
   // Note: consider setting options.sync = true.
   virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
 
+  virtual Status DeleteRange(const WriteOptions&, const Slice& start_key,
+                             const Slice& end_key) = 0;
+
   // Apply the specified updates to the database.
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.
@@ -86,6 +90,10 @@ class LEVELDB_EXPORT DB {
   // May return some other Status on an error.
   virtual Status Get(const ReadOptions& options, const Slice& key,
                      std::string* value) = 0;
+
+  virtual Status Scan(
+      const ReadOptions&, const Slice& start_key, const Slice& end_key,
+      std::vector<std::pair<std::string, std::string>>* result) = 0;
 
   // Return a heap-allocated iterator over the contents of the database.
   // The result of NewIterator() is initially invalid (caller must
@@ -145,6 +153,9 @@ class LEVELDB_EXPORT DB {
   // Therefore the following call will compact the entire database:
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
+
+  // Will use the above described method to compact the entire db
+  virtual Status ForceFullCompaction() = 0;
 };
 
 // Destroy the contents of the specified database.
