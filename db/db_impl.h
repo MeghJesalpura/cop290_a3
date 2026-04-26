@@ -43,6 +43,8 @@ class DBImpl : public DB {
   Status DeleteRange(const WriteOptions&, const Slice& start_key,
                      const Slice& end_key) override;
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
+  Status WriteInternal(const WriteOptions& options, WriteBatch* updates,
+                       bool bypass_stall);
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
 
@@ -102,13 +104,14 @@ class DBImpl : public DB {
           bytes_written(0) {}
   };
 
+  FullCompactionStats* full_compaction_stats_;
+
   struct ManualCompaction {
     int level;
     bool done;
     const InternalKey* begin;  // null means beginning of key range
     const InternalKey* end;    // null means end of key range
     InternalKey tmp_storage;   // Used to keep track of compaction progress
-    FullCompactionStats* stats;
   };
 
   void TEST_FullCompactRange(int level, FullCompactionStats* stats);
@@ -209,6 +212,8 @@ class DBImpl : public DB {
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
+                                      //
+  std::atomic<bool> writes_blocked_;
 
   // Queue of writers.
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);

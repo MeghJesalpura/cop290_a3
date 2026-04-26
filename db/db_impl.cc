@@ -45,12 +45,13 @@ const int kNumNonTableCacheFiles = 10;
 // Information kept for every waiting writer
 struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
-      : batch(nullptr), sync(false), done(false), cv(mu) {}
+      : batch(nullptr), sync(false), done(false), cv(mu), bypass_stall(false) {}
 
   Status status;
   WriteBatch* batch;
   bool sync;
   bool done;
+  bool bypass_stall;
   port::CondVar cv;
 };
 
@@ -149,6 +150,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
+      writes_blocked_(false),
+      full_compaction_stats_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
 
@@ -520,6 +523,11 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   {
     mutex_.Unlock();
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    if (FullCompactionStats* fc_stats_ = full_compaction_stats_) {
+      fc_stats_->bytes_written += meta.file_size;
+      fc_stats_->num_compactions++;
+      fc_stats_->num_output_files++;
+    }
     mutex_.Lock();
   }
 
@@ -600,17 +608,20 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
 }
 
 Status DBImpl::ForceFullCompaction() {
-  FullCompactionStats stats;
-
-  // 1. Flush MemTable to L0
-  Status s = TEST_CompactMemTable();
-  if (!s.ok()) return s;
-
-  // 2. Compact each level sequentially
-  for (int level = 0; level < config::kNumLevels - 1; level++) {
-    // Note: TEST_CompactRange needs to be updated to accept stats
-    TEST_FullCompactRange(level, &stats);
+  {
+    MutexLock l(&mutex_);
+    while (writes_blocked_.load(std::memory_order_acquire)) {
+      background_work_finished_signal_.Wait();
+    }
+    // wait for in-flight writers to drain
+    while (!writers_.empty()) background_work_finished_signal_.Wait();
+    writes_blocked_.store(true, std::memory_order_release);
   }
+
+  FullCompactionStats stats{};
+  full_compaction_stats_ = &stats;
+
+  CompactRange(nullptr, nullptr);
 
   // 3. Report Statistics
   // printf("--------- Manual Compaction Statistics ---------\n");
@@ -621,46 +632,21 @@ Status DBImpl::ForceFullCompaction() {
   // long)stats.bytes_read); printf("Total bytes written:  %llu\n",
   //        (unsigned long long)stats.bytes_written);
   // printf("-----------------------------------------------\n");
+
   printf("%d; %d; %d; %llu; %llu\n", stats.num_compactions,
          stats.num_input_files, stats.num_output_files,
          (unsigned long long)stats.bytes_read,
          (unsigned long long)stats.bytes_written);
 
+  full_compaction_stats_ = nullptr;
+
+  {
+    MutexLock l(&mutex_);
+    writes_blocked_.store(false, std::memory_order_release);
+    background_work_finished_signal_.SignalAll();
+  }
+
   return Status::OK();
-}
-
-void DBImpl::TEST_FullCompactRange(int level, FullCompactionStats* stats) {
-  assert(level >= 0);
-  assert(level + 1 < config::kNumLevels);
-
-  InternalKey begin_storage, end_storage;
-
-  ManualCompaction manual;
-  manual.level = level;
-  manual.done = false;
-  manual.begin = nullptr;
-  manual.end = nullptr;
-  manual.stats = stats;
-
-  MutexLock l(&mutex_);
-  while (!manual.done && !shutting_down_.load(std::memory_order_acquire) &&
-         bg_error_.ok()) {
-    if (manual_compaction_ == nullptr) {  // Idle
-      manual_compaction_ = &manual;
-      MaybeScheduleCompaction();
-    } else {  // Running either my compaction or another compaction.
-      background_work_finished_signal_.Wait();
-    }
-  }
-  // Finish current background compaction in the case where
-  // `background_work_finished_signal_` was signalled due to an error.
-  while (background_compaction_scheduled_) {
-    background_work_finished_signal_.Wait();
-  }
-  if (manual_compaction_ == &manual) {
-    // Cancel my manual compaction since we aborted early for some reason.
-    manual_compaction_ = nullptr;
-  }
 }
 
 void DBImpl::TEST_CompactRange(int level, const Slice* begin,
@@ -789,7 +775,6 @@ void DBImpl::BackgroundCompaction() {
     m->done = (c == nullptr);
     if (c != nullptr) {
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
-      m->stats->num_input_files += c->num_input_files(0);
     }
     Log(options_.info_log,
         "Manual compaction at level-%d from %s .. %s; will stop at %s\n",
@@ -1111,15 +1096,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
 
   mutex_.Lock();
-  if (manual_compaction_ && manual_compaction_->stats) {
-    manual_compaction_->stats->bytes_read += stats.bytes_read;
-    manual_compaction_->stats->bytes_written += stats.bytes_written;
-    manual_compaction_->stats->num_compactions += 1;
-    manual_compaction_->stats->num_input_files +=
-        compact->compaction->num_input_files(0);
-    manual_compaction_->stats->num_input_files +=
-        compact->compaction->num_input_files(1);
-    manual_compaction_->stats->num_output_files += compact->outputs.size();
+  if (FullCompactionStats* fc_stats_ = full_compaction_stats_) {
+    fc_stats_->bytes_read += stats.bytes_read;
+    fc_stats_->bytes_written += stats.bytes_written;
+    fc_stats_->num_compactions += 1;
+    fc_stats_->num_input_files += compact->compaction->num_input_files(0);
+    fc_stats_->num_input_files += compact->compaction->num_input_files(1);
+    fc_stats_->num_output_files += compact->outputs.size();
   }
   stats_[compact->compaction->level() + 1].Add(stats);
 
@@ -1248,7 +1231,8 @@ Status DBImpl::Scan(const ReadOptions& read_opt, const Slice& start_key,
                     std::vector<std::pair<std::string, std::string>>* result) {
   leveldb::Iterator* it = this->NewIterator(read_opt);
   for (it->Seek(start_key);
-       it->Valid() && it->key().ToString() < end_key.ToString(); it->Next()) {
+       it->Valid() && user_comparator()->Compare(it->key(), end_key) < 0;
+       it->Next()) {
     result->push_back({it->key().ToString(), it->value().ToString()});
   }
   Status s = it->status();
@@ -1296,25 +1280,49 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 
 Status DBImpl::DeleteRange(const WriteOptions& write_opt,
                            const Slice& start_key, const Slice& end_key) {
+  {
+    MutexLock l(&mutex_);
+    while (writes_blocked_.load(std::memory_order_acquire)) {
+      background_work_finished_signal_.Wait();
+    }
+    // wait for in-flight writers to drain
+    while (!writers_.empty()) background_work_finished_signal_.Wait();
+    writes_blocked_.store(true, std::memory_order_release);
+  }
+
   leveldb::Iterator* it = this->NewIterator(leveldb::ReadOptions());
   leveldb::WriteBatch batch;
   for (it->Seek(start_key);
-       it->Valid() && it->key().ToString() < end_key.ToString(); it->Next()) {
+       it->Valid() && user_comparator()->Compare(it->key(), end_key) < 0;
+       it->Next()) {
     batch.Delete(it->key());
   }
   Status s = it->status();
-  delete it;
   if (s.ok()) {
-    s = this->Write(write_opt, &batch);
+    s = this->WriteInternal(write_opt, &batch, true);
   }
+  delete it;
+
+  {
+    MutexLock l(&mutex_);
+    writes_blocked_.store(false, std::memory_order_release);
+    background_work_finished_signal_.SignalAll();
+  }
+
   return s;
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+  return WriteInternal(options, updates, /*bypass_stall=*/false);
+}
+
+Status DBImpl::WriteInternal(const WriteOptions& options, WriteBatch* updates,
+                             bool bypass_stall) {
   Writer w(&mutex_);
   w.batch = updates;
   w.sync = options.sync;
   w.done = false;
+  w.bypass_stall = bypass_stall;
 
   MutexLock l(&mutex_);
   writers_.push_back(&w);
@@ -1378,6 +1386,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   // Notify new head of write queue
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
+  } else {
+    background_work_finished_signal_.SignalAll();
   }
 
   return status;
@@ -1441,6 +1451,12 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   bool allow_delay = !force;
   Status s;
   while (true) {
+    if (!writers_.front()->bypass_stall &&
+        writes_blocked_.load(std::memory_order_acquire)) {
+      background_work_finished_signal_.Wait();
+      continue;
+    }
+
     if (!bg_error_.ok()) {
       // Yield previous error
       s = bg_error_;
