@@ -214,6 +214,7 @@ class DBImpl : public DB {
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
                                       //
   std::atomic<bool> writes_blocked_;
+  std::atomic<bool> reads_blocked_;
 
   // Queue of writers.
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);

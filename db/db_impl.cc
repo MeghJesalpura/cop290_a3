@@ -151,6 +151,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       writes_blocked_(false),
+      reads_blocked_(false),
       full_compaction_stats_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
@@ -616,6 +617,7 @@ Status DBImpl::ForceFullCompaction() {
     // wait for in-flight writers to drain
     while (!writers_.empty()) background_work_finished_signal_.Wait();
     writes_blocked_.store(true, std::memory_order_release);
+    reads_blocked_.store(true, std::memory_order_release);
   }
 
   FullCompactionStats stats{};
@@ -642,6 +644,7 @@ Status DBImpl::ForceFullCompaction() {
 
   {
     MutexLock l(&mutex_);
+    reads_blocked_.store(false, std::memory_order_release);
     writes_blocked_.store(false, std::memory_order_release);
     background_work_finished_signal_.SignalAll();
   }
@@ -1147,6 +1150,9 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
                                       SequenceNumber* latest_snapshot,
                                       uint32_t* seed) {
   mutex_.Lock();
+  while (reads_blocked_.load(std::memory_order_acquire)) {
+    background_work_finished_signal_.Wait();
+  }
   *latest_snapshot = versions_->LastSequence();
 
   // Collect together all needed child iterators
@@ -1185,6 +1191,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
                    std::string* value) {
   Status s;
   MutexLock l(&mutex_);
+  while (reads_blocked_.load(std::memory_order_acquire)) {
+    background_work_finished_signal_.Wait();
+  }
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
     snapshot =
