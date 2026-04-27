@@ -114,8 +114,6 @@ class DBImpl : public DB {
     InternalKey tmp_storage;   // Used to keep track of compaction progress
   };
 
-  void TEST_FullCompactRange(int level, FullCompactionStats* stats);
-
   // Per level compaction stats.  stats_[level] stores the stats for
   // compactions that produced data for the specified "level".
   struct CompactionStats {

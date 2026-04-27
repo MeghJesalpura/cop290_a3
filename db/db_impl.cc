@@ -699,7 +699,8 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
 Status DBImpl::TEST_CompactMemTable() {
   // nullptr batch means just wait for earlier writes to be done.
   // Bypass the writes_blocked_ stall so this works when called from
-  // CompactRange under a held ForceFullCompaction flag (otherwise self-deadlock).
+  // CompactRange under a held ForceFullCompaction flag (otherwise
+  // self-deadlock).
   Status s = WriteInternal(WriteOptions(), nullptr, /*bypass_stall=*/true);
   if (s.ok()) {
     // Wait until the compaction completes
@@ -1338,8 +1339,7 @@ Status DBImpl::WriteInternal(const WriteOptions& options, WriteBatch* updates,
   MutexLock l(&mutex_);
   // Stall outside the writers_ queue so that a non-bypass writer can never
   // sit at the front of the queue blocking a queued bypass writer behind it.
-  while (!bypass_stall &&
-         writes_blocked_.load(std::memory_order_acquire)) {
+  while (!bypass_stall && writes_blocked_.load(std::memory_order_acquire)) {
     background_work_finished_signal_.Wait();
   }
   writers_.push_back(&w);
