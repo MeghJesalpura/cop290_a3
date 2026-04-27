@@ -4,25 +4,27 @@
 
 #include "leveldb/db.h"
 
-#include <atomic>
-#include <cinttypes>
-#include <string>
-
-#include "gtest/gtest.h"
 #include "db/db_impl.h"
 #include "db/filename.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <atomic>
+#include <cinttypes>
+#include <string>
+
 #include "leveldb/cache.h"
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/table.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/hash.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
 #include "util/testutil.h"
+
+#include "gtest/gtest.h"
 
 namespace leveldb {
 
@@ -2120,10 +2122,23 @@ class ModelDB : public DB {
   Status Delete(const WriteOptions& o, const Slice& key) override {
     return DB::Delete(o, key);
   }
+  Status DeleteRange(const WriteOptions&, const Slice&, const Slice&) override {
+    assert(false);
+    return Status::NotSupported("ModelDB::DeleteRange");
+  }
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override {
     assert(false);  // Not implemented
     return Status::NotFound(key);
+  }
+  Status Scan(const ReadOptions&, const Slice&, const Slice&,
+              std::vector<std::pair<std::string, std::string>>*) override {
+    assert(false);
+    return Status::NotSupported("ModelDB::Scan");
+  }
+  Status ForceFullCompaction() override {
+    assert(false);
+    return Status::NotSupported("ModelDB::ForceFullCompaction");
   }
   Iterator* NewIterator(const ReadOptions& options) override {
     if (options.snapshot == nullptr) {
