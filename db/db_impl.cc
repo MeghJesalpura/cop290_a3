@@ -617,10 +617,17 @@ Status DBImpl::ForceFullCompaction() {
     while (writes_blocked_.load(std::memory_order_acquire)) {
       background_work_finished_signal_.Wait();
     }
-    // wait for in-flight writers to drain
-    while (!writers_.empty()) background_work_finished_signal_.Wait();
+    // Gate new writers/readers BEFORE draining: otherwise the drain releases
+    // mutex_ in Wait() and fresh callers can keep adding to writers_,
+    // starving FFC.
     writes_blocked_.store(true, std::memory_order_release);
     reads_blocked_.store(true, std::memory_order_release);
+    while (!writers_.empty()) background_work_finished_signal_.Wait();
+    // Wait for any in-flight background compaction to finish so its stats
+    // are not attributed to this FFC.
+    while (background_compaction_scheduled_) {
+      background_work_finished_signal_.Wait();
+    }
     full_compaction_stats_ = &stats;
   }
 
@@ -1291,9 +1298,10 @@ Status DBImpl::DeleteRange(const WriteOptions& write_opt,
     while (writes_blocked_.load(std::memory_order_acquire)) {
       background_work_finished_signal_.Wait();
     }
-    // wait for in-flight writers to drain
-    while (!writers_.empty()) background_work_finished_signal_.Wait();
+    // Gate new writers BEFORE draining; otherwise the drain releases mutex_
+    // in Wait() and fresh writers can keep enqueuing, starving us.
     writes_blocked_.store(true, std::memory_order_release);
+    while (!writers_.empty()) background_work_finished_signal_.Wait();
   }
 
   leveldb::Iterator* it = this->NewIterator(leveldb::ReadOptions());
