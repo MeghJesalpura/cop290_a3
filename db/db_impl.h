@@ -104,7 +104,7 @@ class DBImpl : public DB {
           bytes_written(0) {}
   };
 
-  FullCompactionStats* full_compaction_stats_;
+  FullCompactionStats* full_compaction_stats_ GUARDED_BY(mutex_);
 
   struct ManualCompaction {
     int level;
@@ -210,9 +210,9 @@ class DBImpl : public DB {
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
-                                      //
-  std::atomic<bool> writes_blocked_;
-  std::atomic<bool> reads_blocked_;
+
+  std::atomic<bool> writes_blocked_ GUARDED_BY(mutex_);
+  std::atomic<bool> reads_blocked_ GUARDED_BY(mutex_);
 
   // Queue of writers.
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);

@@ -521,15 +521,17 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
       (unsigned long long)meta.number);
 
   Status s;
+
   {
     mutex_.Unlock();
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
-    if (FullCompactionStats* fc_stats_ = full_compaction_stats_) {
-      fc_stats_->bytes_written += meta.file_size;
-      fc_stats_->num_compactions++;
-      fc_stats_->num_output_files++;
-    }
     mutex_.Lock();
+  }
+
+  if (FullCompactionStats* fc_stats_ = full_compaction_stats_) {
+    fc_stats_->bytes_written += meta.file_size;
+    fc_stats_->num_compactions++;
+    fc_stats_->num_output_files++;
   }
 
   Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
@@ -609,6 +611,7 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
 }
 
 Status DBImpl::ForceFullCompaction() {
+  FullCompactionStats stats{};
   {
     MutexLock l(&mutex_);
     while (writes_blocked_.load(std::memory_order_acquire)) {
@@ -618,32 +621,23 @@ Status DBImpl::ForceFullCompaction() {
     while (!writers_.empty()) background_work_finished_signal_.Wait();
     writes_blocked_.store(true, std::memory_order_release);
     reads_blocked_.store(true, std::memory_order_release);
+    full_compaction_stats_ = &stats;
   }
-
-  FullCompactionStats stats{};
-  full_compaction_stats_ = &stats;
 
   CompactRange(nullptr, nullptr);
 
-  // 3. Report Statistics
-  // printf("--------- Manual Compaction Statistics ---------\n");
-  // printf("Compactions executed: %d\n", stats.num_compactions);
-  // printf("Input files:          %d\n", stats.num_input_files);
-  // printf("Output files:         %d\n", stats.num_output_files);
-  // printf("Total bytes read:     %llu\n", (unsigned long
-  // long)stats.bytes_read); printf("Total bytes written:  %llu\n",
-  //        (unsigned long long)stats.bytes_written);
-  // printf("-----------------------------------------------\n");
-
-  printf("%d; %d; %d; %llu; %llu\n", stats.num_compactions,
-         stats.num_input_files, stats.num_output_files,
-         (unsigned long long)stats.bytes_read,
+  printf("--------- Manual Compaction Statistics ---------\n");
+  printf("Compactions executed: %d\n", stats.num_compactions);
+  printf("Input files:          %d\n", stats.num_input_files);
+  printf("Output files:         %d\n", stats.num_output_files);
+  printf("Total bytes read:     %llu\n", (unsigned long long)stats.bytes_read);
+  printf("Total bytes written:  %llu\n",
          (unsigned long long)stats.bytes_written);
-
-  full_compaction_stats_ = nullptr;
+  printf("-----------------------------------------------\n");
 
   {
     MutexLock l(&mutex_);
+    full_compaction_stats_ = nullptr;
     reads_blocked_.store(false, std::memory_order_release);
     writes_blocked_.store(false, std::memory_order_release);
     background_work_finished_signal_.SignalAll();
